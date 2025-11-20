@@ -1,1 +1,1977 @@
 
+############################################################
+# Full single-cell pipeline for LSCC (GSE150321) - STEPWISE
+############################################################
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(data.table)
+  library(dplyr)
+  library(ggplot2)
+})
+
+############################################################
+# 0. Paths & basic settings
+############################################################
+
+args <- commandArgs(trailingOnly = TRUE)
+
+if (length(args) >= 1) {
+  data_dir <- args[1]
+} else {
+  data_dir <- "D:/Single Cell/GSE150321_RAW"
+}
+
+if (length(args) >= 2) {
+  project_id <- args[2]
+} else {
+  project_id <- "LSCC_GSE150321"
+}
+
+cat("Data directory:", data_dir, "\n")
+cat("Project ID    :", project_id, "\n\n")
+
+setwd(data_dir)
+
+############################################################
+# Stage 1 — Read raw CSV.gz files (per sample)
+############################################################
+
+raw_files <- list.files(data_dir, pattern = "\\.csv\\.gz$", full.names = TRUE)
+cat("Found files:\n")
+print(raw_files)
+
+if (length(raw_files) == 0) {
+  stop("No .csv.gz files found in the folder. Please check the data_dir path.")
+}
+
+read_one_sample <- function(file_path, sample_id = NULL) {
+  if (is.null(sample_id)) {
+    sample_id <- gsub("\\.csv\\.gz$", "", basename(file_path))
+  }
+  message("Reading: ", file_path)
+  dt <- fread(file_path)
+  expr_mat <- as.matrix(dt[, -1, with = FALSE])
+  rownames(expr_mat) <- dt[[1]]
+  if (any(duplicated(rownames(expr_mat)))) {
+    rownames(expr_mat) <- make.unique(rownames(expr_mat))
+  }
+  seu <- CreateSeuratObject(
+    counts       = expr_mat,
+    project      = sample_id,
+    min.cells    = 1,
+    min.features = 1
+  )
+  seu$sample_id <- sample_id
+  return(seu)
+}
+
+seu_list <- list()
+for (f in raw_files) {
+  sid <- gsub("\\.csv\\.gz$", "", basename(f))
+  seu_list[[sid]] <- read_one_sample(f, sample_id = sid)
+}
+
+cat("\n[Stage1] Number of cells before QC:\n")
+n_cells_raw <- sapply(seu_list, ncol)
+print(n_cells_raw)
+
+# Save raw summary table
+stage1_qc <- data.frame(
+  sample_id = names(n_cells_raw),
+  n_cells   = as.numeric(n_cells_raw),
+  stage     = "raw_before_QC"
+)
+write.csv(stage1_qc,
+          file = file.path(data_dir, paste0(project_id, "_Stage1_raw_cell_counts.csv")),
+          row.names = FALSE)
+
+############################################################
+# Stage 2 — QC per sample (nFeature, nCount, percent.mt)
+############################################################
+
+minFeature <- 200
+maxFeature <- 7500
+minCount   <- 400
+maxCount   <- 40000
+maxMT      <- 20
+
+seu_list <- lapply(seu_list, function(seu) {
+  seu[["percent.mt"]] <- PercentageFeatureSet(seu, pattern = "^MT-")
+  subset(
+    seu,
+    subset = nFeature_RNA > minFeature &
+      nFeature_RNA < maxFeature &
+      nCount_RNA    > minCount &
+      nCount_RNA    < maxCount &
+      percent.mt    < maxMT
+  )
+})
+
+cat("\n[Stage2] Number of cells after QC:\n")
+n_cells_qc <- sapply(seu_list, ncol)
+print(n_cells_qc)
+
+stage2_qc <- data.frame(
+  sample_id = names(n_cells_qc),
+  n_cells   = as.numeric(n_cells_qc),
+  stage     = "post_QC"
+)
+write.csv(stage2_qc,
+          file = file.path(data_dir, paste0(project_id, "_Stage2_postQC_cell_counts.csv")),
+          row.names = FALSE)
+
+############################################################
+# Stage 3 — Merge samples
+############################################################
+
+first_name <- names(seu_list)[1]
+lscc <- seu_list[[first_name]]
+if (length(seu_list) > 1) {
+  other_names <- names(seu_list)[-1]
+  lscc <- merge(
+    x            = lscc,
+    y            = seu_list[other_names],
+    add.cell.ids = names(seu_list),
+    project      = project_id
+  )
+}
+
+cat("\n[Stage3] Merged object:\n")
+print(lscc)
+cat("\nCells per sample_id:\n")
+print(table(lscc$sample_id))
+
+# Save metadata after merge
+meta_stage3 <- lscc@meta.data
+write.csv(meta_stage3,
+          file = file.path(data_dir, paste0(project_id, "_Stage3_meta_merged.csv")),
+          row.names = TRUE)
+
+# Seurat v5: join layers
+lscc <- JoinLayers(lscc)
+DefaultAssay(lscc) <- "RNA"
+
+# Save merged Seurat object as RDS
+saveRDS(lscc, file = file.path(data_dir, paste0(project_id, "_Stage3_merged_seurat.rds")))
+
+############################################################
+# Stage 4 — Normalize, HVG, Scale, PCA
+############################################################
+
+lscc <- NormalizeData(lscc)
+lscc <- FindVariableFeatures(lscc, selection.method = "vst", nfeatures = 3000)
+cat("\n[Stage4] Number of variable features:", length(VariableFeatures(lscc)), "\n")
+
+# Save list of variable genes
+write.csv(
+  data.frame(gene = VariableFeatures(lscc)),
+  file = file.path(data_dir, paste0(project_id, "_Stage4_HVG_genes.csv")),
+  row.names = FALSE
+)
+
+lscc <- ScaleData(lscc, features = VariableFeatures(lscc))
+lscc <- RunPCA(lscc, features = VariableFeatures(lscc))
+
+# Elbow plot
+p_elbow <- ElbowPlot(lscc, ndims = 50) +
+  ggtitle("Stage4 - PCA elbow plot")
+ggsave(file.path(data_dir, paste0(project_id, "_Stage4_PCA_Elbow.png")),
+       plot = p_elbow, width = 6, height = 5, dpi = 1200)
+
+# Save Seurat object after PCA
+saveRDS(lscc, file = file.path(data_dir, paste0(project_id, "_Stage4_postPCA_seurat.rds")))
+
+############################################################
+# Stage 5 — Neighbor graph, Clustering, UMAP
+############################################################
+
+dims_use <- 1:30
+lscc <- FindNeighbors(lscc, dims = dims_use)
+lscc <- FindClusters(lscc, resolution = 0.5)
+lscc <- RunUMAP(lscc, dims = dims_use)
+
+# celltype_main initially equals cluster IDs
+lscc$celltype_main <- as.character(lscc$seurat_clusters)
+
+# UMAP by clusters
+p_umap_cluster <- DimPlot(lscc, reduction = "umap",
+                          group.by = "seurat_clusters",
+                          label = TRUE, repel = TRUE) +
+  ggtitle("Stage5 - Global UMAP - clusters") +
+  NoLegend()
+
+# UMAP by sample
+p_umap_sample <- DimPlot(lscc, reduction = "umap",
+                         group.by = "sample_id") +
+  ggtitle("Stage5 - Global UMAP - samples")
+
+ggsave(file.path(data_dir, paste0(project_id, "_Stage5_UMAP_clusters.png")),
+       plot = p_umap_cluster, width = 7, height = 6, dpi = 1200)
+ggsave(file.path(data_dir, paste0(project_id, "_Stage5_UMAP_samples.png")),
+       plot = p_umap_sample, width = 7, height = 6, dpi = 1200)
+
+# Save metadata and Seurat object
+write.csv(lscc@meta.data,
+          file = file.path(data_dir, paste0(project_id, "_Stage5_meta_with_clusters.csv")),
+          row.names = TRUE)
+saveRDS(lscc, file = file.path(data_dir, paste0(project_id, "_Stage5_postUMAP_seurat.rds")))
+
+############################################################
+# Stage 6 — Global markers per cluster (UP + DOWN)
+############################################################
+
+all_markers <- FindAllMarkers(
+  lscc,
+  only.pos        = FALSE,   # both up and down
+  min.pct         = 0.25,
+  logfc.threshold = 0.25
+)
+
+# Add expression direction column
+all_markers$direction <- ifelse(all_markers$avg_log2FC > 0, "up", "down")
+
+# Save full marker table
+write.csv(
+  all_markers,
+  file = file.path(data_dir, paste0(project_id, "_Stage6_cluster_markers_global_up_down.csv")),
+  row.names = FALSE
+)
+
+############################################################
+# Stage 7 — Canonical + LSCC-relevant lineage DotPlot
+############################################################
+
+## T cells
+t_markers <- c("CD3D", "CD3E", "CD2", "TRAC", "CD4", "CD8A", "CD8B")
+
+## B / Plasma cells
+b_markers <- c("MS4A1", "CD79A", "CD79B", "CD19", "CD74", "MZB1", "SDC1")
+
+## Myeloid (general)
+myeloid_markers <- c("LYZ", "CD68", "CD163", "LST1", "CSF1R", "ITGAM", "FCGR3A")
+
+## Tumor / epithelial (base)
+epith_tumor_markers <- c("EPCAM", "KRT8", "KRT18", "KRT5", "KRT14", "KRT17", "TP63")
+
+## Extra squamous / HNSCC epithelial markers
+epith_hnscc_extra <- c("KRT4", "KRT6A", "KRT6B", "KRT16", "KRT1", "KRT10", "KRT13")
+
+## Fibroblasts / CAF
+fibro_markers <- c("COL1A1", "COL1A2", "COL3A1", "TAGLN", "ACTA2", "PDGFRA", "DCN")
+
+## Endothelial
+endo_markers <- c("PECAM1", "CDH5", "VWF", "KDR", "ENG", "RGS5")
+
+## Proliferation
+prolif_markers <- c("MKI67", "TOP2A", "PCNA", "BIRC5")
+
+## Mast cells (very relevant in HNSCC)
+mast_markers <- c("TPSAB1", "TPSB2", "CPA3")
+
+## NK / cytotoxic T
+nk_markers <- c("NKG7", "GNLY", "PRF1", "GZMB", "CTSW")
+
+## TAM / SPP1+ macrophages (optional but useful)
+tam_markers <- c("MRC1", "CD163", "SPP1", "APOE")
+
+## Finalize marker panel
+marker_panel <- unique(c(
+  t_markers,
+  b_markers,
+  myeloid_markers,
+  epith_tumor_markers,
+  epith_hnscc_extra,
+  fibro_markers,
+  endo_markers,
+  prolif_markers,
+  mast_markers,
+  nk_markers,
+  tam_markers
+))
+
+## Keep only genes that actually exist in the Seurat object
+marker_panel <- marker_panel[marker_panel %in% rownames(lscc)]
+
+## Save list of markers used
+write.csv(
+  data.frame(marker = marker_panel),
+  file = file.path(data_dir, paste0(project_id, "_Stage7_marker_panel_used.csv")),
+  row.names = FALSE
+)
+
+## Draw DotPlot
+if (length(marker_panel) > 0) {
+  p_dot <- DotPlot(lscc, features = marker_panel) +
+    RotatedAxis() +
+    ggtitle("Stage7 - Canonical & LSCC lineage markers across clusters")
+  
+  ggsave(
+    file.path(data_dir, paste0(project_id, "_Stage7_lineage_DotPlot.png")),
+    plot = p_dot, width = 10, height = 6, dpi = 1200
+  )
+}
+
+
+
+############################################################
+# Stage 8 — Manual mapping: cluster -> major cell type
+############################################################
+
+cat("\n[Stage8] Current cluster levels:\n")
+print(levels(lscc))
+
+# This is just an example; you can change it later if needed
+cluster_to_celltype <- c(
+  "Tumor/Epithelial",  # 0
+  "T cells",           # 1
+  "Myeloid",           # 2
+  "B/Plasma cells",    # 3
+  "Fibroblasts",       # 4
+  "Endothelial",       # 5
+  "Tumor/Epithelial",  # 6
+  "T cells",           # 7
+  "Myeloid",           # 8
+  "Tumor/Epithelial",  # 9
+  "B/Plasma cells",    # 10
+  "Fibroblasts",       # 11
+  "Myeloid",           # 12
+  "Tumor/Epithelial",  # 13
+  "T cells"            # 14
+)
+
+if (length(cluster_to_celltype) != length(levels(lscc))) {
+  warning("Stage8: Length of cluster_to_celltype does not match number of clusters. celltype_main will remain as cluster IDs for now.")
+} else {
+  names(cluster_to_celltype) <- levels(lscc)
+  lscc <- RenameIdents(lscc, cluster_to_celltype)
+  lscc$celltype_main <- Idents(lscc)
+}
+
+# UMAP with celltype_main
+p_umap_ct <- DimPlot(lscc, reduction = "umap",
+                     group.by = "celltype_main", label = TRUE, repel = TRUE) +
+  ggtitle("Stage8 - Global UMAP - main cell types")
+ggsave(file.path(data_dir, paste0(project_id, "_Stage8_UMAP_celltypes.png")),
+       plot = p_umap_ct, width = 7, height = 6, dpi = 1200)
+
+# Save metadata after annotation
+write.csv(lscc@meta.data,
+          file = file.path(data_dir, paste0(project_id, "_Stage8_meta_with_celltypes.csv")),
+          row.names = TRUE)
+
+############################################################
+# Stage 9 — Per-lineage subsetting & reclustering
+############################################################
+
+run_lineage_pipeline <- function(obj, subset_ids, lineage_name,
+                                 dims_use = 1:20, res = 0.5, project_id, data_dir) {
+  message("Processing lineage: ", lineage_name)
+  valid_ids <- intersect(subset_ids, levels(Idents(obj)))
+  if (length(valid_ids) == 0) {
+    message("  No matching identities for ", lineage_name, " (skipping).")
+    return(NULL)
+  }
+  sub <- subset(obj, idents = valid_ids)
+  if (ncol(sub) < 50) {
+    message("  Too few cells for ", lineage_name, " (", ncol(sub), "), skipping.")
+    return(NULL)
+  }
+  sub <- NormalizeData(sub)
+  sub <- FindVariableFeatures(sub, selection.method = "vst", nfeatures = 3000)
+  sub <- ScaleData(sub, features = VariableFeatures(sub))
+  sub <- RunPCA(sub, features = VariableFeatures(sub))
+  sub <- FindNeighbors(sub, dims = dims_use)
+  sub <- FindClusters(sub, resolution = res)
+  sub <- RunUMAP(sub, dims = dims_use)
+  
+  # UMAP plots
+  p1 <- DimPlot(sub, reduction = "umap", group.by = "seurat_clusters",
+                label = TRUE, repel = TRUE) +
+    ggtitle(paste0("Stage9 - ", lineage_name, " UMAP - clusters")) +
+    NoLegend()
+  p2 <- DimPlot(sub, reduction = "umap", group.by = "sample_id") +
+    ggtitle(paste0("Stage9 - ", lineage_name, " UMAP - samples"))
+  
+  ggsave(file.path(data_dir, paste0(project_id, "_Stage9_", lineage_name, "_UMAP_clusters.png")),
+         plot = p1, width = 6, height = 5, dpi = 1200)
+  ggsave(file.path(data_dir, paste0(project_id, "_Stage9_", lineage_name, "_UMAP_samples.png")),
+         plot = p2, width = 6, height = 5, dpi = 1200)
+  
+  # markers
+  lineage_markers <- FindAllMarkers(
+    sub,
+    only.pos        = TRUE,
+    min.pct         = 0.25,
+    logfc.threshold = 0.25
+  )
+  write.csv(
+    lineage_markers,
+    file = file.path(data_dir, paste0(project_id, "_Stage9_", lineage_name, "_markers.csv")),
+    row.names = FALSE
+  )
+  
+  # Save metadata and RDS
+  write.csv(
+    sub@meta.data,
+    file = file.path(data_dir, paste0(project_id, "_Stage9_", lineage_name, "_meta.csv")),
+    row.names = TRUE
+  )
+  saveRDS(sub,
+          file = file.path(data_dir, paste0(project_id, "_Stage9_", lineage_name, "_seurat.rds")))
+  return(sub)
+}
+
+# These names must match the final celltype_main values
+t_lineage_ids       <- c("T cells")
+b_lineage_ids       <- c("B/Plasma cells")
+myeloid_lineage_ids <- c("Myeloid")
+epith_lineage_ids   <- c("Tumor/Epithelial")
+fibro_lineage_ids   <- c("Fibroblasts")
+endo_lineage_ids    <- c("Endothelial")
+
+t_obj       <- run_lineage_pipeline(lscc, t_lineage_ids,       "T_cells",      project_id = project_id, data_dir = data_dir)
+b_obj       <- run_lineage_pipeline(lscc, b_lineage_ids,       "B_cells",      project_id = project_id, data_dir = data_dir)
+myeloid_obj <- run_lineage_pipeline(lscc, myeloid_lineage_ids, "Myeloid",      project_id = project_id, data_dir = data_dir)
+epith_obj   <- run_lineage_pipeline(lscc, epith_lineage_ids,   "EpithelialTumor", project_id = project_id, data_dir = data_dir)
+fibro_obj   <- run_lineage_pipeline(lscc, fibro_lineage_ids,   "Fibroblasts",  project_id = project_id, data_dir = data_dir)
+endo_obj    <- run_lineage_pipeline(lscc, endo_lineage_ids,    "Endothelial",  project_id = project_id, data_dir = data_dir)
+
+############################################################
+# Stage 10 — Save final global object
+############################################################
+
+saveRDS(lscc,
+        file = file.path(data_dir, paste0(project_id, "_Stage10_Global_annotated_seurat.rds")))
+cat("\nGlobal annotated Seurat object saved to:",
+    file.path(data_dir, paste0(project_id, "_Stage10_Global_annotated_seurat.rds")), "\n")
+
+cat("\nPipeline finished.\n")
+
+
+############################################################
+# Stage 11 — Epithelial labels (Malignant vs Keratinocyte_like, NO DEG)
+# Stage 12 — Epithelial DEGs (Malignant vs Keratinocyte_like, stringent)
+# Prerequisites: epith_obj, data_dir, and project_id must exist from previous stages
+############################################################
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(Matrix)
+  library(data.table)
+})
+
+## ====================== Parameters ======================
+# Stage 11 (automatic cluster selection using module scores)
+delta_thr <- 0.10
+
+# Markers to distinguish malignant vs keratinocyte-like epithelial cells
+markers_epith <- list(
+  A_name = "Malignant",
+  B_name = "Keratinocyte_like",
+  A_up   = c("MKI67","TOP2A","UBE2C","PCNA","TYMS","BIRC5","CCNB1","AURKA","AURKB","KIF11","TK1","H2AFZ","EPCAM","VIM"),
+  B_up   = c("KRT5","KRT14","KRT15","KRT1","KRT10","DSG3","IVL","SPRR1A","SPRR1B","TP63","KRT6A","KRT6B")
+)
+
+# Stage 12 (strict DEG analysis)
+min_cells_per_group <- 50
+logfc_thr_strict    <- 0.50
+minpct_strict       <- 0.20
+test_use_method     <- "wilcox"
+only_pos_genes      <- FALSE   # both up and down
+
+## ====================== Helper functions ======================
+.say <- function(x) message("\n", x, "\n")
+.norm <- function(x){ x <- as.character(x); sub("^[^0-9-]*","",x) }
+
+.avg_by_cluster <- function(obj, assay="RNA", slot="data"){
+  if (!"seurat_clusters" %in% colnames(obj@meta.data))
+    stop("seurat_clusters is not present in metadata.")
+  ae <- suppressWarnings(try(AverageExpression(obj, group.by="seurat_clusters", assays=assay, slot=slot), silent=TRUE))
+  if (inherits(ae,"try-error") || is.null(ae[[assay]]))
+    stop("AverageExpression failed.")
+  as.matrix(ae[[assay]])
+}
+
+.match_genes <- function(genes, ref){
+  idx <- match(toupper(genes), toupper(ref))
+  ref[na.omit(idx)]
+}
+
+.module_score <- function(avg_expr, gene_set){
+  gs <- .match_genes(gene_set, rownames(avg_expr))
+  if (length(gs)==0) return(rep(NA_real_, ncol(avg_expr)))
+  colMeans(avg_expr[gs, , drop=FALSE])
+}
+
+.auto_pick_clusters <- function(obj, markers, delta=0.0, top_k_each=NULL){
+  avg <- .avg_by_cluster(obj)
+  cl_raw <- colnames(avg); cl <- .norm(cl_raw)
+  sA <- .module_score(avg, markers$A_up)
+  sB <- .module_score(avg, markers$B_up)
+  d  <- sA - sB; names(d) <- cl
+  
+  A <- names(d[d >=  delta])
+  B <- names(d[d <= -delta])
+  A <- setdiff(A,B); B <- setdiff(B,A)
+  
+  if (length(A)==0 || length(B)==0){
+    ord <- sort(d, decreasing=TRUE)
+    k <- if (is.null(top_k_each)) max(1, floor(length(ord)/2)) else top_k_each
+    A <- names(head(ord, k))
+    B <- setdiff(names(tail(ord, k)), A)
+  }
+  
+  list(
+    A = intersect(.norm(levels(obj$seurat_clusters)), A),
+    B = intersect(.norm(levels(obj$seurat_clusters)), B),
+    scores = data.frame(cluster=cl, score_A=sA, score_B=sB, diff=as.numeric(d[cl]), check.names=FALSE)
+  )
+}
+
+.write_labels_epith <- function(obj, picks, nameA, nameB, suffix){
+  grp <- ifelse(.norm(obj$seurat_clusters) %in% picks$A, nameA,
+                ifelse(.norm(obj$seurat_clusters) %in% picks$B, nameB, NA))
+  df <- data.frame(
+    cell_barcode   = colnames(obj),
+    seurat_cluster = as.character(obj$seurat_clusters),
+    assigned_group = grp,
+    check.names = FALSE
+  )
+  df <- df[!is.na(df$assigned_group), , drop=FALSE]
+  # Save
+  fwrite(df, file.path(data_dir, paste0(project_id, "_", suffix, "_cells.csv")))
+  fwrite(picks$scores, file.path(data_dir, paste0(project_id, "_", suffix, "_autoSelection.csv")))
+  invisible(df)
+}
+
+.apply_labels_from_csv <- function(obj, labels_csv,
+                                   id_col="cell_barcode", group_col="assigned_group",
+                                   ident_name=".__label__"){
+  if (!file.exists(labels_csv)) { message(" File not found: ", labels_csv); return(NULL) }
+  lab <- tryCatch(fread(labels_csv), error=function(e) NULL)
+  if (is.null(lab) || !(id_col %in% names(lab)) || !(group_col %in% names(lab))) {
+    message(" Required columns were not found in ", labels_csv, "."); return(NULL)
+  }
+  setnames(lab, c(id_col, group_col), c("cell_barcode","assigned_group"), skip_absent=TRUE)
+  lab <- lab[lab$cell_barcode %in% colnames(obj), ]
+  if (nrow(lab)==0) { message(" No cell overlap with object for: ", labels_csv); return(NULL) }
+  
+  md <- obj@meta.data
+  md$.__cb__ <- rownames(md)
+  md <- md |> dplyr::left_join(as.data.frame(lab), by=c(".__cb__"="cell_barcode"))
+  rownames(md) <- md$.__cb__; md$.__cb__ <- NULL
+  obj@meta.data <- md
+  
+  obj[[ident_name]] <- obj@meta.data$assigned_group
+  sub <- subset(obj, subset = !is.na(!!as.name(ident_name)))
+  if (ncol(sub)==0) { message(" Subset is empty after labeling."); return(NULL) }
+  Idents(sub) <- ident_name
+  sub
+}
+
+.run_deg_strict <- function(obj, g1="Malignant", g2="Keratinocyte_like",
+                            suffix="Stage12_Epithelial_Malignant_vs_KeratinocyteLike_DEGs"){
+  n1 <- sum(Idents(obj)==g1); n2 <- sum(Idents(obj)==g2)
+  message("  Number of cells — ", g1, ": ", n1, " | ", g2, ": ", n2)
+  if (n1 < min_cells_per_group || n2 < min_cells_per_group) {
+    message(" Not enough cells (minimum ", min_cells_per_group, "). Skipping: ", suffix)
+    return(NULL)
+  }
+  # Save group counts
+  fwrite(data.table(group=c(g1,g2), n_cells=c(n1,n2)),
+         file.path(data_dir, paste0(project_id, "_", suffix, "_group_counts.csv")))
+  
+  message("  Running FindMarkers (", g1, " vs ", g2, ") ...")
+  deg <- tryCatch({
+    FindMarkers(obj,
+                ident.1         = g1,
+                ident.2         = g2,
+                only.pos        = only_pos_genes,
+                logfc.threshold = logfc_thr_strict,
+                min.pct         = minpct_strict,
+                test.use        = test_use_method
+    )
+  }, error=function(e){ message(" Error in FindMarkers: ", e$message); NULL })
+  
+  if (is.null(deg) || nrow(deg)==0) { message(" DEG result is empty: ", suffix); return(NULL) }
+  
+  tbl <- data.frame(gene=rownames(deg), deg, row.names=NULL, check.names=FALSE)
+  fc_col <- intersect(c("avg_log2FC","avg_logFC","avg_log2fc"), colnames(tbl))[1]
+  if (!is.na(fc_col)) tbl$direction <- ifelse(tbl[[fc_col]] > 0, "up", "down")
+  
+  out_path <- file.path(data_dir, paste0(project_id, "_", suffix, ".csv"))
+  fwrite(tbl, out_path)
+  message(" Saved: ", out_path)
+  tbl
+}
+
+## ====================== Stage 11 ======================
+.say("\n[Stage11] Epithelial labels — Malignant vs Keratinocyte_like\n")
+if (!exists("epith_obj") || is.null(epith_obj)) {
+  stop("epith_obj does not exist. Cannot run Stage11/12.")
+}
+message("  seurat_clusters levels (epith_obj):"); print(levels(epith_obj$seurat_clusters))
+
+picks_ep <- tryCatch(
+  .auto_pick_clusters(epith_obj, markers_epith, delta=delta_thr),
+  error=function(e){ stop("Automatic selection of epithelial clusters failed: ", e$message) }
+)
+message("  Malignant clusters: {", paste(picks_ep$A, collapse=", "), "}")
+message("  Keratinocyte_like clusters: {", paste(picks_ep$B, collapse=", "), "}")
+
+# Save cell labels and cluster score table
+.write_labels_epith(epith_obj, picks_ep, "Malignant","Keratinocyte_like",
+                    "Stage11_Epithelial_Malignant_vs_KeratinocyteLike")
+
+.say("Stage11 finished — the following files were saved:\n - ..._Stage11_Epithelial_Malignant_vs_KeratinocyteLike_cells.csv\n - ..._Stage11_Epithelial_Malignant_vs_KeratinocyteLike_autoSelection.csv")
+
+## ====================== Stage 12 ======================
+.say("\n[Stage12] Epithelial DEGs — Malignant vs Keratinocyte_like (strict)\n")
+
+# Apply Stage 11 labels and run strict DEG
+lab_ep <- file.path(data_dir, paste0(project_id, "_Stage11_Epithelial_Malignant_vs_KeratinocyteLike_cells.csv"))
+epi_sub <- .apply_labels_from_csv(epith_obj, lab_ep)
+if (!is.null(epi_sub)) {
+  # If exact group names are missing, fall back to closest available levels
+  groups <- levels(Idents(epi_sub))
+  g1 <- if ("Malignant" %in% groups) "Malignant" else groups[1]
+  g2 <- if ("Keratinocyte_like" %in% groups) "Keratinocyte_like" else setdiff(groups, g1)[1]
+  .run_deg_strict(epi_sub, g1, g2, "Stage12_Epithelial_Malignant_vs_KeratinocyteLike_DEGs")
+}
+
+.say("Stage12 finished — DEG table and group counts were saved.")
+
+#############################################################
+#####################################################
+# Stage 1   → preprocessing (TMM, annot, transpose, metadata, filter)
+# Stage 2   → split train/valid
+# Stage 3   → DEG, volcano, correlation, GO/KEGG
+# Stage 4   → co-expression (CEMiTool)
+# Stage 5   → bulk × module × scRNA overlap
+# Stage 6   → LASSO + single-gene ROC
+# Stage 7   → ML models (RF/SVM/ANN/GBM)
+#####################################################
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(edgeR)
+  library(limma)
+  library(readr)
+  library(ggplot2)
+  library(dplyr)
+  library(pheatmap)
+  library(RColorBrewer)
+})
+
+# Base path
+project_path <- "D:/LSCC"
+
+# Input files (RAW counts + annot)
+train_expr  <- file.path(project_path, "GSE127165_raw_counts_GRCh38.p13_NCBI.csv")
+test1_expr  <- file.path(project_path, "GSE142083_raw_counts_GRCh38.p13_NCBI.csv")
+test2_expr  <- file.path(project_path, "GSE130605_raw_counts_GRCh38.p13_NCBI.csv")
+
+train_annot <- file.path(project_path, "GSE127165_annot.csv")
+test1_annot <- file.path(project_path, "GSE142083_annot.csv")
+test2_annot <- file.path(project_path, "GSE130605_annot.csv")
+
+############################
+# Stage 1 (part 1) — TMM → log2CPM
+############################
+# --- Train ---
+Xtr_raw <- fread(train_expr, colClasses = c(GeneID = "character"))
+setnames(Xtr_raw, 1, "GeneID")
+cts_tr <- as.matrix(Xtr_raw[, -1, with = FALSE])
+rownames(cts_tr) <- Xtr_raw$GeneID
+y_tr <- DGEList(counts = cts_tr)
+y_tr <- calcNormFactors(y_tr, method = "TMM")
+logCPM_tr <- cpm(y_tr, log = TRUE, prior.count = 1)
+out_tr_s1b <- data.table(GeneID = rownames(logCPM_tr), logCPM_tr, keep.rownames = FALSE)
+fwrite(out_tr_s1b, file.path(project_path, "GSE127165_Stage1b_log2CPM_TMM.csv"))
+
+# --- Test1 ---
+Xt1_raw <- fread(test1_expr, colClasses = c(GeneID = "character"))
+setnames(Xt1_raw, 1, "GeneID")
+cts_t1 <- as.matrix(Xt1_raw[, -1, with = FALSE])
+rownames(cts_t1) <- Xt1_raw$GeneID
+y_t1 <- DGEList(counts = cts_t1)
+y_t1 <- calcNormFactors(y_t1, method = "TMM")
+logCPM_t1 <- cpm(y_t1, log = TRUE, prior.count = 1)
+out_t1_s1b <- data.table(GeneID = rownames(logCPM_t1), logCPM_t1)
+fwrite(out_t1_s1b, file.path(project_path, "GSE142083_Stage1b_log2CPM_TMM.csv"))
+
+# --- Test2 ---
+Xt2_raw <- fread(test2_expr, colClasses = c(GeneID = "character"))
+setnames(Xt2_raw, 1, "GeneID")
+cts_t2 <- as.matrix(Xt2_raw[, -1, with = FALSE])
+rownames(cts_t2) <- Xt2_raw$GeneID
+y_t2 <- DGEList(counts = ccts_t2)
+y_t2 <- calcNormFactors(y_t2, method = "TMM")
+logCPM_t2 <- cpm(y_t2, log = TRUE, prior.count = 1)
+out_t2_s1b <- data.table(GeneID = rownames(logCPM_t2), logCPM_t2)
+fwrite(out_t2_s1b, file.path(project_path, "GSE130605_Stage1b_log2CPM_TMM.csv"))
+
+############################
+# Stage 1 (part 2) — Annotation + symbol aggregation (mean)
+############################
+# --- Train ---
+ann_tr <- fread(train_annot, colClasses = c(GeneID = "character", Symbol = "character"))[, .(GeneID, Symbol)]
+dat_tr <- fread(file.path(project_path, "GSE127165_Stage1b_log2CPM_TMM.csv"),
+                colClasses = c(GeneID = "character"))
+Mtr <- merge(ann_tr, dat_tr, by = "GeneID", all.y = TRUE)
+Mtr <- Mtr[!is.na(Symbol) & Symbol != ""]
+Mtr_agg <- Mtr[, lapply(.SD, function(x) mean(as.numeric(x), na.rm = TRUE)),
+               by = Symbol, .SDcols = setdiff(names(Mtr), c("GeneID","Symbol"))]
+fwrite(Mtr_agg, file.path(project_path, "GSE127165_Stage2_log2CPM_withSymbol_agg.csv"))
+
+# --- Test1 ---
+ann_t1 <- fread(test1_annot, colClasses = c(GeneID = "character", Symbol = "character"))[, .(GeneID, Symbol)]
+dat_t1 <- fread(file.path(project_path, "GSE142083_Stage1b_log2CPM_TMM.csv"),
+                colClasses = c(GeneID = "character"))
+Mt1 <- merge(ann_t1, dat_t1, by = "GeneID", all.y = TRUE)
+Mt1 <- Mt1[!is.na(Symbol) & Symbol != ""]
+Mt1_agg <- Mt1[, lapply(.SD, function(x) mean(as.numeric(x), na.rm = TRUE)),
+               by = Symbol, .SDcols = setdiff(names(Mt1), c("GeneID","Symbol"))]
+fwrite(Mt1_agg, file.path(project_path, "GSE142083_Stage2_log2CPM_withSymbol_agg.csv"))
+
+# --- Test2 ---
+ann_t2 <- fread(test2_annot, colClasses = c(GeneID = "character", Symbol = "character"))[, .(GeneID, Symbol)]
+dat_t2 <- fread(file.path(project_path, "GSE130605_Stage1b_log2CPM_TMM.csv"),
+                colClasses = c(GeneID = "character"))
+Mt2 <- merge(ann_t2, dat_t2, by = "GeneID", all.y = TRUE)
+Mt2 <- Mt2[!is.na(Symbol) & Symbol != ""]
+Mt2_agg <- Mt2[, lapply(.SD, function(x) mean(as.numeric(x), na.rm = TRUE)),
+               by = Symbol, .SDcols = setdiff(names(Mt2), c("GeneID","Symbol"))]
+fwrite(Mt2_agg, file.path(project_path, "GSE130605_Stage2_log2CPM_withSymbol_agg.csv"))
+
+############################
+# Stage 1 (part 3) — Transpose (sample row / gene column)
+############################
+# --- Train ---
+Atr <- fread(file.path(project_path, "GSE127165_Stage2_log2CPM_withSymbol_agg.csv"))
+gtr <- Atr$Symbol
+mtr <- as.data.frame(t(Atr[, -1, with = FALSE])); colnames(mtr) <- gtr
+mtr$Sample <- rownames(mtr); rownames(mtr) <- NULL
+mtr <- mtr[, c("Sample", setdiff(names(mtr), "Sample"))]
+fwrite(mtr, file.path(project_path, "GSE127165_Stage3_transposed.csv"))
+
+# --- Test1 ---
+At1 <- fread(file.path(project_path, "GSE142083_Stage2_log2CPM_withSymbol_agg.csv"))
+gt1 <- At1$Symbol
+mt1 <- as.data.frame(t(At1[, -1, with = FALSE])); colnames(mt1) <- gt1
+mt1$Sample <- rownames(mt1); rownames(mt1) <- NULL
+mt1 <- mt1[, c("Sample", setdiff(names(mt1), "Sample"))]
+fwrite(mt1, file.path(project_path, "GSE142083_Stage3_transposed.csv"))
+
+# --- Test2 ---
+At2 <- fread(file.path(project_path, "GSE130605_Stage2_log2CPM_withSymbol_agg.csv"))
+gt2 <- At2$Symbol
+mt2 <- as.data.frame(t(At2[, -1, with = FALSE])); colnames(mt2) <- gt2
+mt2$Sample <- rownames(mt2); rownames(mt2) <- NULL
+mt2 <- mt2[, c("Sample", setdiff(names(mt2), "Sample"))]
+fwrite(mt2, file.path(project_path, "GSE130605_Stage3_transposed.csv"))
+
+############################
+# Stage 1 (part 4) — Add phenotypes/metadata
+############################
+pheno_tr  <- file.path(project_path, "Pheno_Data_GSE127165.csv")
+pheno_t1  <- file.path(project_path, "Pheno_Data_GSE142083.csv")
+pheno_t2  <- file.path(project_path, "Pheno_Data_GSE130605.csv")
+
+s3_tr <- file.path(project_path, "GSE127165_Stage3_transposed.csv")
+s3_t1 <- file.path(project_path, "GSE142083_Stage3_transposed.csv")
+s3_t2 <- file.path(project_path, "GSE130605_Stage3_transposed.csv")
+
+# --- Train ---
+ph_tr   <- fread(pheno_tr)
+expr_tr <- fread(s3_tr)
+Dtr <- merge(ph_tr, expr_tr, by = "Sample", all.y = TRUE)
+Dtr <- Dtr[, c("Sample","group", setdiff(names(Dtr), c("Sample","group"))), with = FALSE]
+fwrite(Dtr, file.path(project_path, "GSE127165_Stage4_withMetadata.csv"))
+
+# --- Test1 ---
+ph_t1   <- fread(pheno_t1)
+expr_t1 <- fread(s3_t1)
+Dt1 <- merge(ph_t1, expr_t1, by = "Sample", all.y = TRUE)
+Dt1 <- Dt1[, c("Sample","group", setdiff(names(Dt1), c("Sample","group"))), with = FALSE]
+fwrite(Dt1, file.path(project_path, "GSE142083_Stage4_withMetadata.csv"))
+
+# --- Test2 ---
+ph_t2   <- fread(pheno_t2)
+expr_t2 <- fread(s3_t2)
+Dt2 <- merge(ph_t2, expr_t2, by = "Sample", all.y = TRUE)
+Dt2 <- Dt2[, c("Sample","group", setdiff(names(Dt2), c("Sample","group"))), with = FALSE]
+fwrite(Dt2, file.path(project_path, "GSE130605_Stage4_withMetadata.csv"))
+
+############################
+# Stage 1 (part 5) — mRNA-only & remove RP/MT/KRT
+############################
+is_mrna <- function(gt) {
+  grepl("^protein[_ -]?coding$", gt, ignore.case = TRUE) | grepl("mRNA", gt, ignore.case = TRUE)
+}
+
+# --- Train ---
+ann_tr2 <- fread(train_annot)
+keep_syms_tr <- unique(ann_tr2[is_mrna(GeneType) & !is.na(Symbol) & Symbol != "", Symbol])
+keep_syms_tr <- keep_syms_tr[!grepl("^RP[LS]|^MT-|^KRT[0-9]", keep_syms_tr, ignore.case = TRUE)]
+
+DT_tr <- fread(file.path(project_path, "GSE127165_Stage4_withMetadata.csv"))
+feat_tr <- setdiff(names(DT_tr), c("Sample","group"))
+kept_tr <- intersect(feat_tr, keep_syms_tr)
+DT_tr_filt <- DT_tr[, c("Sample","group", kept_tr), with = FALSE]
+fwrite(DT_tr_filt, file.path(project_path, "GSE127165_Stage5_filtered_matrix.csv"))
+
+# --- Test1 ---
+ann_t12 <- fread(test1_annot)
+keep_syms_t1 <- unique(ann_t12[is_mrna(GeneType) & !is.na(Symbol) & Symbol != "", Symbol])
+keep_syms_t1 <- keep_syms_t1[!grepl("^RP[LS]|^MT-|^KRT[0-9]", keep_syms_t1, ignore.case = TRUE)]
+
+DT_t1 <- fread(file.path(project_path, "GSE142083_Stage4_withMetadata.csv"))
+feat_t1 <- setdiff(names(DT_t1), c("Sample","group"))
+kept_t1 <- intersect(feat_t1, keep_syms_t1)
+DT_t1_filt <- DT_t1[, c("Sample","group", kept_t1), with = FALSE]
+fwrite(DT_t1_filt, file.path(project_path, "GSE142083_Stage5_filtered_matrix.csv"))
+
+# --- Test2 ---
+ann_t22 <- fread(test2_annot)
+keep_syms_t2 <- unique(ann_t22[is_mrna(GeneType) & !is.na(Symbol) & Symbol != "", Symbol])
+keep_syms_t2 <- keep_syms_t2[!grepl("^RP[LS]|^MT-|^KRT[0-9]", keep_syms_t2, ignore.case = TRUE)]
+
+DT_t2 <- fread(file.path(project_path, "GSE130605_Stage4_withMetadata.csv"))
+feat_t2 <- setdiff(names(DT_t2), c("Sample","group"))
+kept_t2 <- intersect(feat_t2, keep_syms_t2)
+DT_t2_filt <- DT_t2[, c("Sample","group", kept_t2), with = FALSE]
+fwrite(DT_t2_filt, file.path(project_path, "GSE130605_Stage5_filtered_matrix.csv"))
+
+#####################################################
+# Stage 2 — Split (Train/Valid)
+#####################################################
+suppressPackageStartupMessages({ library(caret) })
+
+s5_train_file <- file.path(project_path, "GSE127165_Stage5_filtered_matrix.csv")
+S_tr <- fread(s5_train_file)
+
+req_cols <- c("Sample", "group")
+if (!all(req_cols %in% names(S_tr))) {
+  stop("Required columns 'Sample' and/or 'group' are missing in the Stage5 file.")
+}
+
+S_tr <- S_tr[, c("Sample","group", setdiff(names(S_tr), c("Sample","group"))), with = FALSE]
+S_tr <- S_tr[!is.na(Sample) & Sample != "" & !is.na(group) & group != ""]
+if (!is.factor(S_tr$group)) S_tr[, group := factor(group)]
+
+set.seed(123)
+idx  <- caret::createDataPartition(S_tr$group, p = 0.70, list = FALSE)
+Train <- S_tr[idx, ]
+Valid <- S_tr[-idx, ]
+
+fwrite(Train, file.path(project_path, "GSE127165_Stage6_Split_Train.csv"))
+fwrite(Valid, file.path(project_path, "GSE127165_Stage6_Split_Valid.csv"))
+
+#####################################################
+# Stage 3 (part 1) — DEG with limma + voomWithQualityWeights
+#####################################################
+s6_train_file  <- file.path(project_path, "GSE127165_Stage6_Split_Train.csv")
+counts_file    <- file.path(project_path, "GSE127165_raw_counts_GRCh38.p13_NCBI.csv")
+annot_file     <- file.path(project_path, "GSE127165_annot.csv")
+
+# Parameters (aligned with Stage 8)
+min_lcpm      <- 0.5
+min_prop      <- 0.20
+fdr_thresh    <- 0.01
+min_abs_logfc <- 1.5
+min_aveexpr   <- 1.0
+
+if (!file.exists(s6_train_file)) stop("Stage 7: Stage 6 (Train) file not found.")
+Tr7 <- fread(s6_train_file)
+if (!all(c("Sample","group") %in% names(Tr7))) stop("Stage 7: Required columns are missing in Train.")
+
+Tr7 <- Tr7[, c("Sample","group", setdiff(names(Tr7), c("Sample","group"))), with = FALSE]
+train_samples <- Tr7$Sample
+genes_stage6  <- setdiff(names(Tr7), c("Sample","group"))
+
+cts_raw <- fread(counts_file, colClasses = c(GeneID = "character"))
+setnames(cts_raw, 1, "GeneID")
+annot <- fread(annot_file, colClasses = c(GeneID = "character", Symbol = "character"))[, .(GeneID, Symbol)]
+
+cts_annot <- merge(annot, cts_raw, by = "GeneID", all.y = TRUE)
+cts_annot <- cts_annot[!is.na(Symbol) & Symbol != ""]
+keep_cols <- intersect(colnames(cts_annot), train_samples)
+if (length(keep_cols) < 2L) stop("Stage 7: Not enough overlapping count columns.")
+
+cts_sym <- cts_annot[, lapply(.SD, function(x) as.numeric(as.character(x))), by = Symbol, .SDcols = keep_cols]
+counts_mat <- as.matrix(cts_sym[, ..keep_cols])
+rownames(counts_mat) <- cts_sym$Symbol
+mode(counts_mat) <- "numeric"
+
+common_syms <- intersect(rownames(counts_mat), genes_stage6)
+if (length(common_syms) < 50L) warning(sprintf("Stage 7: After intersecting with Stage6 genes, only %d genes remain.", length(common_syms)))
+counts_mat <- counts_mat[common_syms, , drop = FALSE]
+counts_mat <- counts_mat[, train_samples, drop = FALSE]
+
+dge <- DGEList(counts = counts_mat)
+dge <- calcNormFactors(dge, method = "TMM")
+
+grp <- factor(Tr7$group)
+if ("Normal" %in% levels(grp)) grp <- relevel(grp, ref = "Normal")
+if (length(levels(grp)) < 2L) stop(sprintf("Stage 7: Only one class observed in Train: %s", levels(grp)[1]))
+
+design <- model.matrix(~ 0 + grp)
+colnames(design) <- levels(grp)
+
+vw <- voomWithQualityWeights(dge, design = design, plot = FALSE, normalize.method = "none")
+
+present_rate <- rowMeans(vw$E > min_lcpm)
+keep_pre <- present_rate >= min_prop
+vw$E       <- vw$E[keep_pre, , drop = FALSE]
+vw$weights <- vw$weights[keep_pre, , drop = FALSE]
+if (nrow(vw$E) < 50) warning(sprintf("Stage 7: After presence filter, only %d genes remain.", nrow(vw$E)))
+
+fit <- lmFit(vw, design)
+if (all(c("Normal","Tumor") %in% colnames(design))) {
+  cont <- makeContrasts(Tumor - Normal, levels = design)
+} else {
+  cont <- makeContrasts(contrasts = paste0(colnames(design)[2], " - ", colnames(design)[1]), levels = design)
+}
+fit  <- contrasts.fit(fit, cont)
+fit  <- eBayes(fit, trend = TRUE)
+
+TT_full <- topTable(fit, number = Inf, adjust.method = "BH", sort.by = "B")
+TT_full$Gene.symbol <- rownames(TT_full)
+if (!"AveExpr" %in% colnames(TT_full)) {
+  ave_expr <- rowMeans(vw$E, na.rm = TRUE)
+  TT_full$AveExpr <- ave_expr[rownames(TT_full)]
+}
+TT_full <- TT_full[, c("Gene.symbol","logFC","AveExpr","P.Value","adj.P.Val")]
+readr::write_csv(TT_full, file.path(project_path, "GSE127165_Stage7_DE_topTable_full.csv"))
+
+strict_idx <- with(TT_full, (adj.P.Val < fdr_thresh) & (abs(logFC) >= min_abs_logfc) & (AveExpr >= min_aveexpr))
+TT_strict <- TT_full[strict_idx, , drop = FALSE]
+readr::write_csv(TT_strict, file.path(project_path, "GSE127165_Stage7_DE_topTable_strict.csv"))
+
+UP_strict   <- unique(TT_strict$Gene.symbol[TT_strict$logFC >  0])
+DOWN_strict <- unique(TT_strict$Gene.symbol[TT_strict$logFC <  0])
+UPDN_strict <- union(UP_strict, DOWN_strict)
+write.table(UP_strict,   file.path(project_path, "GSE127165_Stage7_DE_up_strict.txt"),
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+write.table(DOWN_strict, file.path(project_path, "GSE127165_Stage7_DE_down_strict.txt"),
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+write.table(UPDN_strict, file.path(project_path, "GSE127165_Stage7_DE_updown_strict.txt"),
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+# Sample quality weights for QC
+sample_w <- colMeans(vw$weights, na.rm = TRUE)
+qc_dt <- data.table(Sample = colnames(vw$E),
+                    quality_weight = as.numeric(sample_w))
+fwrite(qc_dt, file.path(project_path, "GSE127165_Stage7_sample_quality_weights.csv"))
+
+#####################################################
+# Stage 3 (part 2) — Volcano plots from Stage 7
+#####################################################
+padj_cut  <- 0.01   # = fdr_thresh
+logfc_cut <- 1.5    # = min_abs_logfc
+eps       <- 1e-300
+
+tt_full_file   <- file.path(project_path, "GSE127165_Stage7_DE_topTable_full.csv")
+tt_strict_file <- file.path(project_path, "GSE127165_Stage7_DE_topTable_strict.csv")
+
+volcano_png_full   <- file.path(project_path, "GSE127165_Stage8_volcano_full.png")
+volcano_png_strict <- file.path(project_path, "GSE127165_Stage8_volcano_strict.png")
+volcano_data_full  <- file.path(project_path, "GSE127165_Stage8_volcano_data_full.csv")
+
+if (!file.exists(tt_full_file)) stop("Stage 8: Stage7 full file not found.")
+TT_full_v <- readr::read_csv(tt_full_file, show_col_types = FALSE)
+
+need_cols <- c("Gene.symbol", "logFC", "adj.P.Val")
+if (!all(need_cols %in% colnames(TT_full_v))) stop("Stage 8: Required columns are missing in TT_full.")
+
+TT_full_v <- TT_full_v %>%
+  filter(!is.na(logFC) & !is.na(adj.P.Val)) %>%
+  mutate(neglog10padj = -log10(pmax(adj.P.Val, eps)),
+         threshold = case_when(
+           adj.P.Val < padj_cut & logFC >=  logfc_cut ~ "Up",
+           adj.P.Val < padj_cut & logFC <= -logfc_cut ~ "Down",
+           TRUE ~ "NS"
+         ),
+         threshold = factor(threshold, levels = c("Up","Down","NS")))
+
+readr::write_csv(TT_full_v, volcano_data_full)
+
+p_full <- ggplot(TT_full_v, aes(x = logFC, y = neglog10padj, color = threshold)) +
+  geom_point(alpha = .7, size = 1.8) +
+  scale_color_manual(values = c(Up = "#E75480", Down = "#6A5ACD", NS = "gray70")) +
+  geom_vline(xintercept = c(-logfc_cut, logfc_cut), linetype = 2) +
+  geom_hline(yintercept = -log10(padj_cut), linetype = 2) +
+  theme_bw(base_size = 12) +
+  labs(title = "Volcano (Train DEGs) — Full", x = "log2 Fold Change", y = "-log10(FDR)", color = NULL)
+
+ggsave(volcano_png_full, p_full, width = 8, height = 7, dpi = 1200)
+
+# Optional strict volcano
+if (file.exists(tt_strict_file)) {
+  TT_strict_v <- readr::read_csv(tt_strict_file, show_col_types = FALSE) %>%
+    filter(!is.na(logFC) & !is.na(adj.P.Val)) %>%
+    mutate(neglog10padj = -log10(pmax(adj.P.Val, eps)),
+           threshold = case_when(
+             adj.P.Val < padj_cut & logFC >=  logfc_cut ~ "Up",
+             adj.P.Val < padj_cut & logFC <= -logfc_cut ~ "Down",
+             TRUE ~ "NS"
+           ),
+           threshold = factor(threshold, levels = c("Up","Down","NS")))
+  p_strict <- ggplot(TT_strict_v, aes(x = logFC, y = neglog10padj, color = threshold)) +
+    geom_point(alpha = .8, size = 2.0) +
+    scale_color_manual(values = c(Up = "#E75480", Down = "#6A5ACD", NS = "gray70")) +
+    geom_vline(xintercept = c(-logfc_cut, logfc_cut), linetype = 2) +
+    geom_hline(yintercept = -log10(padj_cut), linetype = 2) +
+    theme_bw(base_size = 12) +
+    labs(title = "Volcano (Train DEGs) — Strict", x = "log2 Fold Change", y = "-log10(FDR)", color = NULL)
+  ggsave(volcano_png_strict, p_strict, width = 8, height = 7, dpi = 1200)
+}
+
+#####################################################
+# Stage 3 (part 3) — Sample correlation heatmap (standard)
+#####################################################
+tr_file <- file.path(project_path, "GSE127165_Stage6_Split_Train.csv")
+if (!file.exists(tr_file)) stop("Stage 9A: Stage 6 Train split file not found.")
+Tr0 <- data.table::fread(tr_file)
+
+Tr0 <- Tr0[, c("Sample","group", setdiff(names(Tr0), c("Sample","group"))), with = FALSE]
+g0  <- setdiff(names(Tr0), c("Sample","group"))
+Mat <- as.matrix(data.frame(lapply(Tr0[, ..g0], function(x) as.numeric(as.character(x))), check.names = FALSE))
+rownames(Mat) <- Tr0$Sample
+
+Cor <- cor(t(Mat), method = "pearson", use = "pairwise.complete.obs")
+ann <- data.frame(group = Tr0$group); rownames(ann) <- Tr0$Sample
+ann_cols <- list(group = c(Normal = "gray70", Tumor = "#E75480"))
+
+pal <- colorRampPalette(c("gray70", "#FFFFFF", "#E75480"))(301)
+brk <- seq(-1, 1, length.out = 302)
+
+png(file.path(project_path, "GSE127165_Stage9A_train_sample_correlation.png"),
+    width = 2200, height = 2000, res = 300)
+pheatmap::pheatmap(
+  Cor, color = pal, breaks = brk,
+  cluster_rows = TRUE, cluster_cols = TRUE,
+  show_rownames = FALSE, show_colnames = FALSE, border_color = NA,
+  annotation_row = ann, annotation_col = ann, annotation_colors = ann_cols,
+  main = "TRAIN — Sample–Sample Pearson (Stage 9A)"
+)
+dev.off()
+
+#####################################################
+# Stage 3 (part 3) — Sample correlation heatmap (contrast-enhanced)
+#####################################################
+method_cor    <- "spearman"   # "spearman" or "pearson"
+q_low_high    <- c(0.05, 0.95)
+min_bandwidth <- 0.05
+png_out       <- file.path(project_path, "GSE127165_Stage9A_train_sample_correlation.png")  # deliberate overwrite
+
+# Recompute correlation (or reuse Mat)
+Cor_raw <- cor(t(Mat), method = method_cor, use = "pairwise.complete.obs")
+
+ut <- upper.tri(Cor_raw, diag = FALSE)
+qs <- quantile(Cor_raw[ut], probs = q_low_high, na.rm = TRUE)
+lo <- as.numeric(qs[1]); hi <- as.numeric(qs[2])
+if ((hi - lo) < min_bandwidth) {
+  mid <- (hi + lo) / 2
+  lo <- mid - min_bandwidth/2
+  hi <- mid + min_bandwidth/2
+  lo <- max(lo, -1); hi <- min(hi, 1)
+}
+Cor_clipped <- pmin(pmax(Cor_raw, lo), hi)
+
+ann <- data.frame(group = Tr0$group); rownames(ann) <- Tr0$Sample
+ann_cols <- list(group = c(Normal = "gray70", Tumor = "#E75480"))
+
+n_col <- 301
+pal2 <- colorRampPalette(brewer.pal(11, "RdBu"))(n_col)
+pal2 <- rev(pal2)
+brk2 <- seq(lo, hi, length.out = n_col + 1)
+
+png(png_out, width = 2400, height = 2200, res = 300)
+pheatmap::pheatmap(
+  Cor_clipped, color = pal2, breaks = brk2,
+  cluster_rows = TRUE, cluster_cols = TRUE,
+  show_rownames = FALSE, show_colnames = FALSE, border_color = NA,
+  annotation_row = ann, annotation_col = ann, annotation_colors = ann_cols,
+  main = sprintf("TRAIN — Sample–Sample %s (Stage 9A)\nclipped to [%0.2f, %0.2f]",
+                 tools::toTitleCase(method_cor), lo, hi)
+)
+dev.off()
+
+#####################################################
+# Stage 3 (part 4) — GO & KEGG Top-10 rich-factor bubble plots
+#####################################################
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(clusterProfiler)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+})
+
+# ---------- Base ----------
+project_path <- "D:/LSCC"
+setwd(project_path)
+
+# ---------- Input genes (SYMBOL) ----------
+# Prefer Stage7 list; fallback to alternative
+sym_stage7 <- file.path(project_path, "GSE127165_Stage7_DE_updown_strict.txt")
+sym_alt    <- file.path(project_path, "differentialExpressionAnalysis", "updown.txt")
+if (file.exists(sym_stage7)) {
+  symbols <- scan(sym_stage7, what = character(), quiet = TRUE)
+} else if (file.exists(sym_alt)) {
+  symbols <- scan(sym_alt, what = character(), quiet = TRUE)
+} else {
+  stop("Stage 10: Gene list file not found (Stage7 or differentialExpressionAnalysis).")
+}
+symbols <- unique(symbols)
+
+# ---------- Helper functions ----------
+mk_bubble_df <- function(res_df, top_n = 10, per_group = NULL) {
+  if (is.null(res_df) || !nrow(res_df)) return(NULL)
+  df <- res_df %>%
+    filter(!is.na(geneID), geneID != "") %>%
+    mutate(
+      RichFactor = if ("setSize" %in% names(.)) {
+        Count / setSize
+      } else {  # fallback from GeneRatio
+        as.numeric(sub("/.*$", "", GeneRatio)) / as.numeric(sub("^.*/", "", GeneRatio))
+      },
+      ColorVar = if ("qvalue" %in% names(.) && any(!is.na(qvalue))) qvalue else p.adjust,
+      Pathway  = Description
+    ) %>%
+    filter(!is.na(RichFactor), is.finite(RichFactor))
+  
+  if (!nrow(df)) return(NULL)
+  
+  if (!is.null(per_group) && per_group %in% names(df)) {
+    df <- df %>%
+      group_by(.data[[per_group]]) %>%
+      arrange(desc(RichFactor), .by_group = TRUE) %>%
+      slice_head(n = top_n) %>%
+      ungroup()
+  } else {
+    df <- df %>%
+      arrange(desc(RichFactor)) %>%
+      slice_head(n = top_n)
+  }
+  df
+}
+
+# Bubble plot with reversed size and color direction
+plot_bubble <- function(df, title = "", facet = NULL) {
+  if (is.null(df) || !nrow(df)) {
+    return(ggplot() + theme_void() + ggtitle(paste(title, "\n(no significant terms)")))
+  }
+  df <- df %>%
+    mutate(
+      PathwayLab = stringr::str_trunc(Pathway, 60),
+      PathwayLab = factor(PathwayLab, levels = rev(unique(PathwayLab[order(RichFactor)])))
+    )
+  
+  p <- ggplot(df, aes(x = RichFactor, y = PathwayLab, size = Count, color = ColorVar)) +
+    geom_point() +
+    scale_y_discrete(name = "Pathway") +
+    scale_x_continuous(name = "Rich factor") +
+    # Reverse bubble size: larger Count → smaller bubble
+    scale_size_continuous(name = "Gene number", trans = "reverse") +
+    # Reverse color: smaller q more purple, larger q more orange
+    scale_color_gradientn(
+      colours = c("#FCA636", "#E16462", "#B12A90", "#6A00A8"),
+      name = if ("qvalue" %in% names(df) && any(!is.na(df$qvalue))) "q-value" else "adjusted p"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.title.y = element_blank()
+    ) +
+    labs(title = title)
+  
+  if (!is.null(facet) && facet %in% names(df)) {
+    p <- p + facet_wrap(reformulate(facet), scales = "free_y", ncol = 1)
+  }
+  p
+}
+
+# =========================
+# GO — Top 10 per ontology
+# =========================
+ego_all <- enrichGO(
+  gene          = symbols,
+  OrgDb         = "org.Hs.eg.db",
+  ont           = "ALL",
+  keyType       = "SYMBOL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+readr::write_csv(as.data.frame(ego_all), file.path(project_path, "Stage10_GO_results.csv"))
+
+go_df <- mk_bubble_df(ego_all@result, top_n = 10, per_group = "ONTOLOGY")
+
+png(file.path(project_path, "Stage10_GO_Top10_RichFactor.png"),
+    width = 2200, height = 1600, res = 300)
+print(plot_bubble(go_df, title = "Top 10 GO enrichment (Rich factor)", facet = "ONTOLOGY"))
+dev.off()
+
+# =========================
+# KEGG — Top 10 overall
+# =========================
+# KEGG uses ENTREZ IDs
+entrez_df <- AnnotationDbi::mapIds(
+  x = org.Hs.eg.db, keys = symbols, keytype = "SYMBOL",
+  column = "ENTREZID", multiVals = "first"
+) %>% as.data.frame() %>% na.omit()
+colnames(entrez_df) <- "ENTREZID"
+kegg_genes <- unique(as.character(entrez_df$ENTREZID))
+kegg_genes <- kegg_genes[!is.na(kegg_genes) & nzchar(kegg_genes)]
+
+ekegg <- enrichKEGG(
+  gene          = kegg_genes,
+  organism      = "hsa",
+  keyType       = "ncbi-geneid",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+ekegg_df <- as.data.frame(ekegg)
+readr::write_csv(ekegg_df, file.path(project_path, "Stage10_KEGG_results.csv"))
+
+kegg_bubble <- mk_bubble_df(ekegg_df, top_n = 10, per_group = NULL)
+
+png(file.path(project_path, "Stage10_KEGG_Top10_RichFactor.png"),
+    width = 2000, height = 1400, res = 300)
+print(plot_bubble(kegg_bubble, title = "Top 10 KEGG enrichment (Rich factor)"))
+dev.off()
+
+message("Stage 10 — DONE\nSaved:",
+        "\n  • ", file.path(project_path, "Stage10_GO_results.csv"),
+        "\n  • ", file.path(project_path, "Stage10_GO_Top10_RichFactor.png"),
+        "\n  • ", file.path(project_path, "Stage10_KEGG_results.csv"),
+        "\n  • ", file.path(project_path, "Stage10_KEGG_Top10_RichFactor.png"))
+
+#####################################################
+# Stage 4 — Co-expression analysis via CEMiTool (Train)
+#####################################################
+suppressPackageStartupMessages({
+  library(data.table)
+  library(CEMiTool)
+})
+
+# All outputs directly in project_path (e.g. D:/LSCC)
+s11_dir <- project_path   # no subfolders, no dir.create
+
+# ---------- Load & process ----------
+s6_train_csv <- file.path(project_path, "GSE127165_Stage6_Split_Train.csv")
+if (!file.exists(s6_train_csv)) stop("Stage 11: Stage 6 (Train) file not found: ", s6_train_csv)
+trainingSet <- as.data.frame(fread(s6_train_csv, data.table = FALSE))
+
+# Check required columns
+stopifnot(all(c("Sample","group") %in% names(trainingSet)))
+
+# Gene (rows) × sample (cols) expression matrix
+samples <- trainingSet$Sample
+groups  <- trainingSet$group
+expr_dt <- trainingSet[, setdiff(names(trainingSet), c("Sample","group")), drop = FALSE]
+expr_dt[] <- lapply(expr_dt, function(x) as.numeric(as.character(x)))
+expr_mat <- t(as.matrix(expr_dt))                # rows: genes, cols: samples
+colnames(expr_mat) <- samples
+
+# Save expression profile and phenotypes
+write.csv(expr_mat,
+          file = file.path(s11_dir, paste0("GeneExpressionProfileOf", ncol(expr_mat), "Samples.csv")),
+          quote = FALSE)
+
+# Map group labels to Normal/Tumor if numeric
+if (is.numeric(groups) || is.integer(groups)) {
+  groups <- ifelse(as.integer(groups) == 1, "Normal",
+                   ifelse(as.integer(groups) == 2, "Tumor", as.character(groups)))
+} else {
+  groups <- gsub("^1$", "Normal", groups)
+  groups <- gsub("^2$", "Tumor",  groups)
+}
+phenData <- data.frame(ID = colnames(expr_mat), Group = groups, check.names = FALSE)
+write.csv(phenData,
+          file = file.path(s11_dir, paste0("DiseasePhenotypesOf", ncol(expr_mat), "Samples.csv")),
+          quote = FALSE, row.names = FALSE)
+
+# ---------- Gene sets & interactions (package example; replace with custom if needed) ----------
+gmtData <- read_gmt(system.file("extdata", "pathways.gmt", package = "CEMiTool"))
+intData <- read.delim(system.file("extdata", "interactions.tsv", package = "CEMiTool"))
+
+# ---------- Run CEMiTool ----------
+cem <- cemitool(
+  expr   = as.data.frame(expr_mat),
+  annot  = phenData,
+  gmt    = gmtData,
+  interactions = intData,
+  sample_name_column = "ID",
+  class_column      = "Group",
+  plot    = TRUE,
+  verbose = TRUE
+)
+
+# ---------- Outputs ----------
+# All outputs go directly into s11_dir == D:/LSCC
+generate_report(cem, directory = s11_dir,
+                force = TRUE, output_format = "html_document")
+write_files(cem, directory = s11_dir, force = TRUE)
+save_plots(cem, value = c("all"), force = TRUE, directory = s11_dir)
+
+# Some key plots as PNG
+png(file.path(s11_dir, "beta_r2.png"), height = 1600, width = 1600, res = 300); show_plot(cem, "beta_r2"); dev.off()
+png(file.path(s11_dir, "mean_k.png"),  height = 1600, width = 1600, res = 300); show_plot(cem, "mean_k");  dev.off()
+png(file.path(s11_dir, "gsea.png"),    height = 1600, width = 1600, res = 300); show_plot(cem, "gsea");   dev.off()
+png(file.path(s11_dir, "ora_M1.png"),  height = 1600, width = 1600, res = 300); show_plot(cem, "ora")$M1; dev.off()
+
+# Extract genes from important modules (example: M7/M1)
+# module.tsv is now written directly in s11_dir by write_files()
+mods_path <- file.path(s11_dir, "module.tsv")
+if (file.exists(mods_path)) {
+  mods <- fread(mods_path)
+  sigMods  <- c("M1")   # change if needed
+  sigGenes <- mods$genes[mods$modules %in% sigMods]
+  write.table(sigGenes, file = file.path(s11_dir, "modulesGenes.txt"),
+              quote = FALSE, row.names = FALSE, col.names = FALSE)
+} else {
+  warning("Stage 11: module.tsv file not found; a module may not have been detected or the Tables path may be different.")
+}
+
+############################
+# Stage 5 — Bulk DEGs × Module(M1) × scRNA DEGs (venn + overlap csv)
+############################
+suppressPackageStartupMessages({ library(data.table); library(ggvenn) })
+
+bulk_dir      <- "D:/LSCC"
+scrna_dir     <- "D:/Single Cell/GSE150321_RAW"   # no extra spaces
+
+bulk_deg_file <- file.path(bulk_dir,  "GSE127165_Stage7_DE_updown_strict.txt")
+module_file   <- file.path(bulk_dir,  "GSE127165_Stage11_CEMiTool", "modulesGenes.txt")
+scrna_deg_csv <- file.path(scrna_dir, "LSCC_GSE150321_Stage12_Epithelial_Malignant_vs_KeratinocyteLike_DEGs.csv")
+
+stopifnot(file.exists(bulk_deg_file), file.exists(module_file), file.exists(scrna_deg_csv))
+
+Bulk_DEGs  <- unique(trimws(fread(bulk_deg_file,  header = FALSE)$V1))
+Module_M1  <- unique(trimws(fread(module_file,    header = FALSE)$V1))
+
+# Safe gene column reading: if header "gene" exists, use it; otherwise use first column
+colnames_check <- names(fread(scrna_deg_csv, nrows = 0))
+if ("gene" %in% colnames_check) {
+  scRNA_DEGs <- unique(trimws(fread(scrna_deg_csv, select = "gene")[[1]]))
+} else {
+  scRNA_DEGs <- unique(trimws(fread(scrna_deg_csv, select = 1)[[1]]))
+}
+
+# 3-set Venn
+sets3 <- list(Bulk_DEGs = Bulk_DEGs, Module_M1 = Module_M1, scRNA_DEGs = scRNA_DEGs)
+png(file.path(bulk_dir, "GSE127165_Stage12_Venn_All3.png"), width = 1800, height = 1600, res = 300)
+ggvenn(sets3, show_elements = FALSE, show_percentage = FALSE, fill_color = c("#BEA7C7","#E88094","#7CC6FE"),
+       fill_alpha = 0.3, text_size = 6, set_name_size = 5.5, text_color = "black", stroke_alpha = 0.5, stroke_size = 0.2)
+dev.off()
+
+# Triple-overlap CSV
+overlap_all3 <- Reduce(intersect, sets3)
+fwrite(data.table(Gene = overlap_all3),
+       file = file.path(bulk_dir, "GSE127165_Stage12_Overlap_All3.csv"))
+
+#####################################################
+# Stage 6 (part 1) — LASSO logistic regression on triple overlap
+#####################################################
+suppressPackageStartupMessages({
+  library(data.table)
+  library(glmnet)
+  library(forcats)
+  library(ggplot2)
+  library(dplyr)
+})
+
+project_path <- "D:/LSCC"
+setwd(project_path)
+
+# --- Files
+s6_train_csv  <- file.path(project_path, "GSE127165_Stage6_Split_Train.csv")
+keygenes_file <- file.path(project_path, "GSE127165_Stage12_Overlap_All3.csv")
+
+if (!file.exists(s6_train_csv))  stop("Stage 13: Train file (Stage6) not found: ", s6_train_csv)
+if (!file.exists(keygenes_file)) stop("Stage 13: Overlap file Stage12_Overlap_All3 not found: ", keygenes_file)
+
+# --- Read Train data
+trainSet <- as.data.frame(fread(s6_train_csv))
+stopifnot(all(c("Sample","group") %in% names(trainSet)))
+
+# Factor group with levels Normal/Tumor
+trainGroup <- trainSet$group
+if (!is.factor(trainGroup)) trainGroup <- factor(trainGroup)
+# Try mapping 1/2 to Normal/Tumor if needed
+if (all(sort(unique(as.character(trainGroup))) %in% c("1","2"))) {
+  trainGroup <- fct_recode(trainGroup, "Normal" = "1", "Tumor" = "2")
+}
+# Ensure level order
+if (!all(c("Normal","Tumor") %in% levels(trainGroup))) {
+  lv <- levels(trainGroup)
+  if (length(lv) >= 2) levels(trainGroup) <- c("Normal","Tumor", lv[-(1:2)])
+}
+trainGroup <- fct_relevel(trainGroup, "Normal", "Tumor")
+
+# Feature matrix
+rownames(trainSet) <- trainSet$Sample
+trainData <- trainSet[, setdiff(names(trainSet), c("Sample","group")), drop = FALSE]
+
+# --- Key genes (triple overlap)
+keyGenes <- fread(keygenes_file, header = FALSE)$V1
+keyGenes <- unique(na.omit(keyGenes))
+
+# Subset columns to key genes
+keep_cols <- intersect(colnames(trainData), keyGenes)
+if (length(keep_cols) < 2L) stop("Stage 13: Number of overlapping genes is insufficient for LASSO.")
+trainData <- trainData[, keep_cols, drop = FALSE]
+
+# Convert to numeric if needed
+trainData[] <- lapply(trainData, function(x) as.numeric(as.character(x)))
+
+# Final data frame
+train_df <- cbind(group = trainGroup, as.data.frame(trainData))
+
+# --- LASSO (logistic)
+set.seed(123)
+x <- model.matrix(group ~ ., train_df)[, -1, drop = FALSE]
+y <- ifelse(train_df$group == "Tumor", 1, 0)
+
+cv.lasso <- cv.glmnet(
+  x, y,
+  alpha = 1,
+  family = "binomial",
+  type.measure = "deviance",
+  nfolds = 10
+)
+
+# Save deviance vs lambda plot
+png(filename = file.path(project_path, "GSE127165_Stage13_Lambda_BinomialDeviance.png"),
+    width = 1800, height = 1800, res = 300)
+plot(cv.lasso, axes = TRUE, cex.lab = 1.4, cex.axis = 1.2)
+dev.off()
+
+# Save best lambda
+write.table(
+  cv.lasso$lambda.min,
+  file = file.path(project_path, "GSE127165_Stage13_lambda_min.txt"),
+  quote = FALSE, row.names = FALSE, col.names = FALSE
+)
+
+# Final model at lambda.min
+lasso.model <- glmnet(
+  x, y,
+  alpha = 1,
+  family = "binomial",
+  lambda = cv.lasso$lambda.min
+)
+
+# Non-zero coefficients
+beta_vec <- as.numeric(lasso.model$beta[, 1])
+names(beta_vec) <- rownames(lasso.model$beta)
+nonzero_idx <- which(beta_vec != 0)
+coef_nonzero <- beta_vec[nonzero_idx]
+
+df_coef <- data.frame(
+  gene = names(coef_nonzero),
+  coefficient = as.numeric(coef_nonzero),
+  row.names = NULL,
+  check.names = FALSE
+)
+
+# Outputs
+write.csv(df_coef,
+          file.path(project_path, "GSE127165_Stage13_coefficients.csv"),
+          row.names = FALSE)
+write.table(names(coef_nonzero),
+            file = file.path(project_path, "GSE127165_Stage13_lassoGenes.txt"),
+            quote = FALSE, sep = "\t", row.names = FALSE, col.names = FALSE)
+
+# --- Horizontal bar plot of non-zero coefficients
+dat <- df_coef %>%
+  arrange(coefficient) %>%
+  mutate(
+    Gene = factor(gene, levels = gene),
+    Direction = ifelse(coefficient > 0, "Positive", "Negative"),
+    Label = signif(coefficient, 3)
+  )
+
+p_coef <- ggplot(dat, aes(x = coefficient, y = Gene, fill = Direction)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = Label),
+            hjust = ifelse(dat$coefficient > 0, -0.1, 1.1),
+            size = 3) +
+  scale_fill_manual(values = c(Positive = "#E75480", Negative = "#6A5ACD")) +
+  theme_bw() +
+  xlab("Coefficient") + ylab(NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(size = 13),
+    axis.text.x  = element_text(colour = "black", size = 10),
+    axis.text.y  = element_text(colour = "black", size = 9)
+  )
+
+ggsave(
+  filename = file.path(project_path, "GSE127165_Stage13_nonZeroCoefGenes.png"),
+  plot = p_coef, width = 8, height = 7, dpi = 1200
+)
+
+#####################################################
+# Stage 6 (part 2) — ROC for LASSO-selected genes (Train/Valid)
+#####################################################
+suppressPackageStartupMessages({
+  library(pROC)
+  library(data.table)
+})
+
+project_path <- "D:/LSCC"
+setwd(project_path)
+
+# ---------- Utility: automatic mfrow grid ----------
+.square_mfrow <- function(n) {
+  r <- floor(sqrt(n)); c <- ceiling(n / r); c(r, c)
+}
+
+# ---------- ROC plotting helper ----------
+rocCurve <- function(data_list, genes, path, mfrow = NULL,
+                     train_col = "#083A45", valid_col = "#74192B",
+                     w = 2400, h = 2400) {
+  
+  if (is.null(mfrow)) mfrow <- .square_mfrow(length(genes))
+  png(filename = path, width = w, height = h, res = 300)
+  par(mfrow = mfrow)
+  for (g in genes) {
+    roc.train <- roc(as.formula(paste("group ~", g)),
+                     data = data_list[[1]], auc = TRUE, ci = TRUE)
+    roc.valid <- roc(as.formula(paste("group ~", g)),
+                     data = data_list[[2]], auc = TRUE, ci = TRUE)
+    
+    plot.roc(roc.train,
+             col = train_col,
+             legacy.axes = FALSE,
+             main = g,
+             cex.main = 1.2,
+             lwd = 2.2,
+             cex.lab = 1.2)
+    
+    lines(roc.valid, col = valid_col, lwd = 2.2)
+    legend("bottomright",
+           legend = c(
+             paste0("train AUC = ", signif(roc.train$auc * 100, digits = 4), "%"),
+             paste0("valid AUC = ", signif(roc.valid$auc * 100, digits = 4), "%")
+           ),
+           col = c(train_col, valid_col),
+           lty = 1, lwd = 2.2, cex = 1.1)
+  }
+  dev.off()
+}
+
+# ---------- Biomarkers from Stage13 ----------
+biom_file <- file.path(project_path, "GSE127165_Stage13_lassoGenes.txt")
+if (!file.exists(biom_file))
+  stop("Stage 14: LASSO genes file (Stage13) not found: ", biom_file)
+biomarkers <- sort(unique(fread(biom_file, header = FALSE)$V1))
+
+# ---------- Train ----------
+tr_csv <- file.path(project_path, "GSE127165_Stage6_Split_Train.csv")
+if (!file.exists(tr_csv)) stop("Stage 14: Train Stage6 file not found: ", tr_csv)
+trainSet <- as.data.frame(fread(tr_csv))
+
+stopifnot(all(c("Sample","group") %in% names(trainSet)))
+rownames(trainSet) <- trainSet$Sample
+
+grp_tr <- trainSet$group
+if (!is.factor(grp_tr)) grp_tr <- factor(grp_tr)
+# Possible 1/2 mapping to Normal/Tumor
+if (all(sort(unique(as.character(grp_tr))) %in% c("1","2"))) {
+  levels(grp_tr) <- c("Normal","Tumor")
+}
+grp_tr <- forcats::fct_relevel(grp_tr, "Normal", "Tumor")
+
+expr_tr <- trainSet[, setdiff(names(trainSet), c("Sample","group")), drop = FALSE]
+
+# ---------- Valid ----------
+va_csv <- file.path(project_path, "GSE127165_Stage6_Split_Valid.csv")
+if (!file.exists(va_csv)) stop("Stage 14: Valid Stage6 file not found: ", va_csv)
+validSet <- as.data.frame(fread(va_csv))
+
+stopifnot(all(c("Sample","group") %in% names(validSet)))
+rownames(validSet) <- validSet$Sample
+
+grp_va <- validSet$group
+if (!is.factor(grp_va)) grp_va <- factor(grp_va)
+if (all(sort(unique(as.character(grp_va))) %in% c("1","2"))) {
+  levels(grp_va) <- c("Normal","Tumor")
+}
+grp_va <- forcats::fct_relevel(grp_va, "Normal", "Tumor")
+
+expr_va <- validSet[, setdiff(names(validSet), c("Sample","group")), drop = FALSE]
+
+# ---------- Keep only available biomarkers ----------
+common_genes <- Reduce(intersect, list(colnames(expr_tr), colnames(expr_va), biomarkers))
+if (length(common_genes) < 1L)
+  stop("Stage 14: None of the biomarkers were found in the Train/Valid matrices.")
+if (length(common_genes) < length(biomarkers)) {
+  warning(sprintf("Stage 14: Only %d of %d biomarkers were found. Continuing with the common genes.",
+                  length(common_genes), length(biomarkers)))
+}
+
+train_df <- cbind(group = grp_tr, as.data.frame(expr_tr[, common_genes, drop = FALSE]))
+valid_df <- cbind(group = grp_va, as.data.frame(expr_va[, common_genes, drop = FALSE]))
+data_list <- list(train_df, valid_df)
+
+# ---------- Plots ----------
+# 1) All common genes (auto layout)
+rocCurve(
+  data_list,
+  genes = common_genes,
+  path  = file.path(project_path, "GSE127165_Stage14_ROC_all.png"),
+  mfrow = NULL,
+  w = 3400, h = 3400
+)
+
+# 2) Subset (remove indices 3 and 5 if exist)
+subset_genes <- common_genes
+rm_idx <- c(3, 5)
+rm_idx <- rm_idx[rm_idx <= length(common_genes)]
+if (length(rm_idx)) subset_genes <- subset_genes[-rm_idx]
+
+rocCurve(
+  data_list,
+  genes = subset_genes,
+  path  = file.path(project_path, "GSE127165_Stage14_ROC_subset.png"),
+  mfrow = NULL,
+  w = 3400, h = 3400
+)
+
+#####################################################
+# Stage 7 — ML training & evaluation (RF / SVM / GBM)
+# All outputs directly in: D:/LSCC
+#####################################################
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(caret)
+  library(pROC)
+  library(MLmetrics)
+  library(randomForest)
+  library(e1071)
+  library(dplyr)
+  library(h2o)
+})
+
+project_path <- "D:/LSCC"
+out_dir <- project_path   # <-- all outputs go directly here
+
+set.seed(123)
+
+# ---------- Helper: safe factor to Normal/Tumor ----------
+.normalize_group <- function(v) {
+  f <- as.factor(v)
+  lv <- levels(f)
+  if (all(sort(unique(as.character(f))) %in% c("1","2"))) {
+    f <- factor(f, levels = c("1","2"), labels = c("Normal","Tumor"))
+  } else {
+    if (!all(c("Normal","Tumor") %in% levels(f))) {
+      levels(f) <- make.names(levels(f))
+    }
+    if ("Normal" %in% levels(f) & "Tumor" %in% levels(f)) {
+      f <- forcats::fct_relevel(f, "Normal","Tumor")
+    } else {
+      if (length(levels(f)) >= 2) {
+        f <- factor(f, levels = levels(f)[1:2], labels = c("Normal","Tumor"))
+      }
+    }
+  }
+  f
+}
+
+# ---------- Load Stage6 Train/Valid ----------
+train_csv <- file.path(project_path, "GSE127165_Stage6_Split_Train.csv")
+valid_csv <- file.path(project_path, "GSE127165_Stage6_Split_Valid.csv")
+stopifnot(file.exists(train_csv), file.exists(valid_csv))
+
+trainSet <- as.data.frame(fread(train_csv))
+validSet <- as.data.frame(fread(valid_csv))
+stopifnot(all(c("Sample","group") %in% colnames(trainSet)),
+          all(c("Sample","group") %in% colnames(validSet)))
+
+rownames(trainSet) <- trainSet$Sample
+rownames(validSet) <- validSet$Sample
+
+trainGroup <- .normalize_group(trainSet$group)
+validGroup <- .normalize_group(validSet$group)
+
+trainData <- trainSet[, setdiff(names(trainSet), c("Sample","group")), drop = FALSE]
+validData <- validSet[, setdiff(names(validSet), c("Sample","group")), drop = FALSE]
+
+# ---------- Load Stage5 Test matrices ----------
+test1_csv <- file.path(project_path, "GSE142083_Stage5_filtered_matrix.csv")
+test2_csv <- file.path(project_path, "GSE130605_Stage5_filtered_matrix.csv")
+stopifnot(file.exists(test1_csv), file.exists(test2_csv))
+
+test1 <- as.data.frame(fread(test1_csv))
+test2 <- as.data.frame(fread(test2_csv))
+stopifnot(all(c("Sample","group") %in% colnames(test1)),
+          all(c("Sample","group") %in% colnames(test2)))
+
+rownames(test1) <- test1$Sample
+rownames(test2) <- test2$Sample
+
+test1Group <- .normalize_group(test1$group)
+test2Group <- .normalize_group(test2$group)
+
+test1Data <- test1[, setdiff(names(test1), c("Sample","group")), drop = FALSE]
+test2Data <- test2[, setdiff(names(test2), c("Sample","group")), drop = FALSE]
+
+# ---------- Biomarkers from Stage13 (minus indices 3 and 5) ----------
+biom_file <- file.path(project_path, "GSE127165_Stage13_lassoGenes.txt")
+stopifnot(file.exists(biom_file))
+
+biomarkers <- sort(unique(fread(biom_file, header = FALSE)$V1))
+
+rm_idx <- c(3, 5)
+rm_idx <- rm_idx[rm_idx <= length(biomarkers)]
+if (length(rm_idx)) biomarkers <- biomarkers[-rm_idx]
+
+# ---------- Align features across all splits ----------
+common_genes <- Reduce(intersect, list(
+  colnames(trainData), colnames(validData),
+  colnames(test1Data), colnames(test2Data), biomarkers
+))
+if (length(common_genes) < 2L) stop("Stage15: Number of common genes is insufficient.")
+
+to_numeric <- function(df) { df[] <- lapply(df, function(x) as.numeric(as.character(x))); df }
+
+trainX <- to_numeric(trainData[, common_genes, drop = FALSE])
+validX <- to_numeric(validData[, common_genes, drop = FALSE])
+test1X <- to_numeric(test1Data[, common_genes, drop = FALSE])
+test2X <- to_numeric(test2Data[, common_genes, drop = FALSE])
+
+trainDF <- cbind(group = trainGroup, trainX)
+validDF <- cbind(group = validGroup, validX)
+test1DF <- cbind(group = test1Group, test1X)
+test2DF <- cbind(group = test2Group, test2X)
+
+# ---------- Utilities: metrics + ROC plotting ----------
+.write_cm <- function(cm, path) write.csv(cm, path, row.names = TRUE)
+
+.metrics_bin <- function(y_true_factor, y_pred_factor, y_prob_tumor = NULL) {
+  roc_obj <- if (!is.null(y_prob_tumor)) roc(y_true_factor ~ as.numeric(y_prob_tumor), ci = TRUE) else NULL
+  
+  yt <- as.numeric(y_true_factor)
+  yp <- as.numeric(y_pred_factor)
+  
+  data.frame(
+    AUC        = if (!is.null(roc_obj)) roc_obj$auc[1] else NA_real_,
+    CI         = if (!is.null(roc_obj)) sprintf("%0.4f-%0.4f", roc_obj$ci[1], roc_obj$ci[3]) else NA_character_,
+    accuracy   = Accuracy(yp, yt),
+    sensitivity= Sensitivity(yt, yp, positive = 2),
+    specificity= Specificity(yt, yp, positive = 2),
+    precision  = Precision(yt, yp, positive = 2),
+    recall     = Recall(yt, yp, positive = 2),
+    f1score    = F1_Score(yt, yp, positive = 2),
+    row.names  = NULL
+  )
+}
+
+roc.curve.compare <- function(rocs, cols, main, mods, out_png) {
+  png(out_png, width = 1800, height = 1800, res = 300)
+  plot.roc(rocs[[1]], col = cols[1], legacy.axes = FALSE, main = main,
+           cex.main = 1.5, lwd = 2.5, cex.lab = 1.5)
+  for (i in 2:length(rocs)) lines(rocs[[i]], col = cols[i])
+  legend("bottomright",
+         legend = sapply(seq_along(rocs), function(i)
+           sprintf("%s (AUC=%s%%)",
+                   mods[i], signif(rocs[[i]]$auc * 100, digits = 4))),
+         col = cols, lty = 1, lwd = 3, cex = 1.2)
+  dev.off()
+}
+
+# ---------- RANDOM FOREST ----------
+ntree <- 500
+tuned_rf <- tuneRF(trainX, trainGroup, ntreeTry = ntree, stepFactor = 1.5,
+                   improve = 0.05, trace = TRUE, plot = FALSE)
+best.m <- tuned_rf[tuned_rf[,2] == min(tuned_rf[,2]),1][1]
+rf_model <- randomForest(group ~ ., data = trainDF, mtry = best.m,
+                         importance = TRUE, ntree = ntree)
+
+# ---------- SVM (linear) ----------
+svm_tune <- tune(svm, group ~ ., data = trainDF, kernel = "linear",
+                 ranges = list(cost = c(0.1, 1, 10),
+                               gamma = c(0.1, 0.01, 0.001)))
+svm_model <- svm(group ~ ., data = trainDF, kernel = "linear",
+                 cost = svm_tune$best.parameters$cost,
+                 gamma = svm_tune$best.parameters$gamma,
+                 probability = TRUE)
+
+# ---------- GBM (H2O) ----------
+h2o.init()
+
+tmp_train_csv <- file.path(out_dir, "Stage15_train_tmp.csv")
+tmp_valid_csv <- file.path(out_dir, "Stage15_valid_tmp.csv")
+tmp_test1_csv <- file.path(out_dir, "Stage15_test1_tmp.csv")
+tmp_test2_csv <- file.path(out_dir, "Stage15_test2_tmp.csv")
+
+fwrite(trainDF, tmp_train_csv)
+fwrite(validDF, tmp_valid_csv)
+fwrite(test1DF, tmp_test1_csv)
+fwrite(test2DF, tmp_test2_csv)
+
+train_h2o <- h2o.importFile(tmp_train_csv)
+valid_h2o <- h2o.importFile(tmp_valid_csv)
+test1_h2o <- h2o.importFile(tmp_test1_csv)
+test2_h2o <- h2o.importFile(tmp_test2_csv)
+
+response <- "group"
+predictors <- setdiff(colnames(train_h2o), c(response, "Sample"))
+
+train_h2o[, response] <- as.factor(train_h2o[, response])
+valid_h2o[, response] <- as.factor(valid_h2o[, response])
+test1_h2o[, response] <- as.factor(test1_h2o[, response])
+test2_h2o[, response] <- as.factor(test2_h2o[, response])
+
+gbm_model <- h2o.gbm(x = predictors, y = response,
+                     training_frame = train_h2o, ntrees = 100)
+
+# ---------- A) TRAIN ----------
+rf.train.pred  <- predict(rf_model,  trainX)
+rf.train.prob  <- predict(rf_model,  trainX, type = "prob")[,"Tumor"]
+svm.train.pred <- predict(svm_model, trainX)
+svm.train.prob <- attr(predict(svm_model, trainX, probability = TRUE),
+                       "probabilities")[,"Tumor"]
+gbm.train.pred <- as.data.frame(h2o.predict(gbm_model, newdata = train_h2o))$predict
+gbm.train.prob <- as.data.frame(h2o.predict(gbm_model, newdata = train_h2o))$Tumor
+
+.write_cm(table(trainGroup, rf.train.pred),  file.path(out_dir, "RF.train.confusion.csv"))
+.write_cm(table(trainGroup, svm.train.pred), file.path(out_dir, "SVM.train.confusion.csv"))
+.write_cm(table(trainGroup, gbm.train.pred), file.path(out_dir, "GBM.train.confusion.csv"))
+
+rf.train.metrics  <- .metrics_bin(trainGroup, rf.train.pred,  rf.train.prob)
+svm.train.metrics <- .metrics_bin(trainGroup, svm.train.pred, svm.train.prob)
+gbm.train.metrics <- .metrics_bin(trainGroup, gbm.train.pred, gbm.train.prob)
+
+write.csv(rf.train.metrics,  file.path(out_dir, "RF.train.metrics.csv"),  row.names = FALSE)
+write.csv(svm.train.metrics, file.path(out_dir, "SVM.train.metrics.csv"), row.names = FALSE)
+write.csv(gbm.train.metrics, file.path(out_dir, "GBM.train.metrics.csv"), row.names = FALSE)
+
+rf.train.roc  <- roc(trainGroup ~ as.numeric(rf.train.prob),  ci = TRUE)
+svm.train.roc <- roc(trainGroup ~ as.numeric(svm.train.prob), ci = TRUE)
+gbm.train.roc <- roc(trainGroup ~ as.numeric(gbm.train.prob), ci = TRUE)
+
+# ---------- B) VALID ----------
+rf.valid.pred  <- predict(rf_model,  validX)
+rf.valid.prob  <- predict(rf_model,  validX, type = "prob")[,"Tumor"]
+svm.valid.pred <- predict(svm_model, validX)
+svm.valid.prob <- attr(predict(svm_model, validX, probability = TRUE),
+                       "probabilities")[,"Tumor"]
+gbm.valid.pred <- as.data.frame(h2o.predict(gbm_model, newdata = valid_h2o))$predict
+gbm.valid.prob <- as.data.frame(h2o.predict(gbm_model, newdata = valid_h2o))$Tumor
+
+.write_cm(table(validGroup, rf.valid.pred),  file.path(out_dir, "RF.valid.confusion.csv"))
+.write_cm(table(validGroup, svm.valid.pred), file.path(out_dir, "SVM.valid.confusion.csv"))
+.write_cm(table(validGroup, gbm.valid.pred), file.path(out_dir, "GBM.valid.confusion.csv"))
+
+rf.valid.metrics  <- .metrics_bin(validGroup, rf.valid.pred,  rf.valid.prob)
+svm.valid.metrics <- .metrics_bin(validGroup, svm.valid.pred, svm.valid.prob)
+gbm.valid.metrics <- .metrics_bin(validGroup, gbm.valid.pred, gbm.valid.prob)
+
+write.csv(rf.valid.metrics,  file.path(out_dir, "RF.valid.metrics.csv"),  row.names = FALSE)
+write.csv(svm.valid.metrics, file.path(out_dir, "SVM.valid.metrics.csv"), row.names = FALSE)
+write.csv(gbm.valid.metrics, file.path(out_dir, "GBM.valid.metrics.csv"), row.names = FALSE)
+
+rf.valid.roc  <- roc(validGroup ~ as.numeric(rf.valid.prob),  ci = TRUE)
+svm.valid.roc <- roc(validGroup ~ as.numeric(svm.valid.prob), ci = TRUE)
+gbm.valid.roc <- roc(validGroup ~ as.numeric(gbm.valid.prob), ci = TRUE)
+
+# ---------- C) TEST1 (GSE142083) ----------
+rf.t1.pred  <- predict(rf_model,  test1X)
+rf.t1.prob  <- predict(rf_model,  test1X, type = "prob")[,"Tumor"]
+svm.t1.pred <- predict(svm_model, test1X)
+svm.t1.prob <- attr(predict(svm_model, test1X, probability = TRUE),
+                    "probabilities")[,"Tumor"]
+gbm.t1.pred <- as.data.frame(h2o.predict(gbm_model, newdata = test1_h2o))$predict
+gbm.t1.prob <- as.data.frame(h2o.predict(gbm_model, newdata = test1_h2o))$Tumor
+
+.write_cm(table(test1Group, rf.t1.pred),  file.path(out_dir, "RF.test_GSE142083.confusion.csv"))
+.write_cm(table(test1Group, svm.t1.pred), file.path(out_dir, "SVM.test_GSE142083.confusion.csv"))
+.write_cm(table(test1Group, gbm.t1.pred), file.path(out_dir, "GBM.test_GSE142083.confusion.csv"))
+
+rf.t1.metrics  <- .metrics_bin(test1Group, rf.t1.pred,  rf.t1.prob)
+svm.t1.metrics <- .metrics_bin(test1Group, svm.t1.pred, svm.t1.prob)
+gbm.t1.metrics <- .metrics_bin(test1Group, gbm.t1.pred, gbm.t1.prob)
+
+write.csv(rf.t1.metrics,  file.path(out_dir, "RF.test_GSE142083.metrics.csv"),  row.names = FALSE)
+write.csv(svm.t1.metrics, file.path(out_dir, "SVM.test_GSE142083.metrics.csv"), row.names = FALSE)
+write.csv(gbm.t1.metrics, file.path(out_dir, "GBM.test_GSE142083.metrics.csv"), row.names = FALSE)
+
+rf.t1.roc  <- roc(test1Group ~ as.numeric(rf.t1.prob),  ci = TRUE)
+svm.t1.roc <- roc(test1Group ~ as.numeric(svm.t1.prob), ci = TRUE)
+gbm.t1.roc <- roc(test1Group ~ as.numeric(gbm.t1.prob), ci = TRUE)
+
+# ---------- D) TEST2 (GSE130605) ----------
+rf.t2.pred  <- predict(rf_model,  test2X)
+rf.t2.prob  <- predict(rf_model,  test2X, type = "prob")[,"Tumor"]
+svm.t2.pred <- predict(svm_model, test2X)
+svm.t2.prob <- attr(predict(svm_model, test2X, probability = TRUE),
+                    "probabilities")[,"Tumor"]
+gbm.t2.pred <- as.data.frame(h2o.predict(gbm_model, newdata = test2_h2o))$predict
+gbm.t2.prob <- as.data.frame(h2o.predict(gbm_model, newdata = test2_h2o))$Tumor
+
+.write_cm(table(test2Group, rf.t2.pred),  file.path(out_dir, "RF.test_GSE130605.confusion.csv"))
+.write_cm(table(test2Group, svm.t2.pred), file.path(out_dir, "SVM.test_GSE130605.confusion.csv"))
+.write_cm(table(test2Group, gbm.t2.pred), file.path(out_dir, "GBM.test_GSE130605.confusion.csv"))
+
+rf.t2.metrics  <- .metrics_bin(test2Group, rf.t2.pred,  rf.t2.prob)
+svm.t2.metrics <- .metrics_bin(test2Group, svm.t2.pred, svm.t2.prob)
+gbm.t2.metrics <- .metrics_bin(test2Group, gbm.t2.pred, gbm.t2.prob)
+
+write.csv(rf.t2.metrics,  file.path(out_dir, "RF.test_GSE130605.metrics.csv"),  row.names = FALSE)
+write.csv(svm.t2.metrics, file.path(out_dir, "SVM.test_GSE130605.metrics.csv"), row.names = FALSE)
+write.csv(gbm.t2.metrics, file.path(out_dir, "GBM.test_GSE130605.metrics.csv"), row.names = FALSE)
+
+rf.t2.roc  <- roc(test2Group ~ as.numeric(rf.t2.prob),  ci = TRUE)
+svm.t2.roc <- roc(test2Group ~ as.numeric(svm.t2.prob), ci = TRUE)
+gbm.t2.roc <- roc(test2Group ~ as.numeric(gbm.t2.prob), ci = TRUE)
+
+# ---------- ROC plots (3 models on each dataset) ----------
+cols <- c("#6C8CC7", "#ED008C", "#019B83")
+mods <- c("RF", "SVM", "GBM")
+
+roc.curve.compare(
+  list(rf.train.roc, svm.train.roc, gbm.train.roc),
+  cols, "Training Dataset", mods,
+  file.path(out_dir, "ROC_Training.png")
+)
+roc.curve.compare(
+  list(rf.valid.roc, svm.valid.roc, gbm.valid.roc),
+  cols, "Validation Dataset", mods,
+  file.path(out_dir, "ROC_Validation.png")
+)
+roc.curve.compare(
+  list(rf.t1.roc, svm.t1.roc, gbm.t1.roc),
+  cols, "Test Dataset (GSE142083)", mods,
+  file.path(out_dir, "ROC_Test_GSE142083.png")
+)
+roc.curve.compare(
+  list(rf.t2.roc, svm.t2.roc, gbm.t2.roc),
+  cols, "Test Dataset (GSE130605)", mods,
+  file.path(out_dir, "ROC_Test_GSE130605.png")
+)
+
+# ---------- Save models ----------
+saveRDS(rf_model,  file.path(out_dir, "RF_model.rds"))
+saveRDS(svm_model, file.path(out_dir, "SVM_model.rds"))
+h2o.saveModel(gbm_model, path = out_dir, force = TRUE)
+
+# ---------- Housekeeping ----------
+h2o.shutdown(prompt = FALSE)
